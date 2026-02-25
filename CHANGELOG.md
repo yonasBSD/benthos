@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 
 ## 4.82.0 - TBD
 
+### Changed
+
+- `tigerbeetle_cdc` input: adds the `timeout_seconds` configuration and triggers
+   [monitoring](https://docs.redpanda.com/redpanda-connect/guides/monitoring/) in case
+   of lost connectivity with the TigerBeetle cluster. (@batiati)
+
 ### Fixed
 
 - `test` command: Templates registered via the `-t` flag are now correctly available during test execution. (@Phantal)
