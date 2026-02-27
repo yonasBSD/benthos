@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -455,6 +456,32 @@ path: "%v"
 	require.NoError(t, ackFunc(ctx, nil))
 
 	require.NoError(t, block.Close(ctx))
+}
+
+func TestBufferSQLitePermissionDenied(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping permission test: running as root")
+	}
+
+	tmpDir := t.TempDir()
+	restrictedDir := filepath.Join(tmpDir, "restricted")
+	require.NoError(t, os.Mkdir(restrictedDir, 0o777))
+	require.NoError(t, os.Chmod(restrictedDir, 0o555)) // read+execute only, no write
+	t.Cleanup(func() {
+		_ = os.Chmod(restrictedDir, 0o755) // restore so TempDir cleanup can delete it
+	})
+
+	dbPath := filepath.Join(restrictedDir, "test.db")
+	conf, err := sql.SQLiteBufferConfig().ParseYAML(fmt.Sprintf(`path: %q`, dbPath), nil)
+	require.NoError(t, err)
+
+	_, err = sql.NewSQLiteBufferFromConfig(
+		conf,
+		service.MockResources(),
+	)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "out of memory")
+	assert.Contains(t, err.Error(), "permission denied")
 }
 
 func BenchmarkBufferSQLiteWrites(b *testing.B) {
