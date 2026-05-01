@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -388,23 +390,94 @@ func (r *Router) buildSchemaWithResolver(record map[string]any, msg *service.Mes
 	ti := newTypeInferrer(r.caseSensitive)
 	fields := make([]iceberg.NestedField, 0, len(record))
 
-	for name, value := range record {
-		fieldType, err := r.resolver.resolveTypeForCreateTable(name, value, msg, key.namespace, key.table, ti)
+	// Parse the schema metadata once; it's used for both column ordering and
+	// per-field type resolution.
+	common, err := r.resolver.parseSchemaMetadata(msg)
+	if err != nil {
+		return nil, fmt.Errorf("parsing schema metadata: %w", err)
+	}
+
+	// Build the final column ordering. Metadata-declared fields come first in
+	// the order they appear there, with case-folded matching against record
+	// keys when caseSensitive is false. Any record keys not declared in the
+	// metadata are appended in sorted order so create-table is deterministic
+	// and never silently drops record fields.
+	//
+	// When a record key matches a metadata field, the metadata's casing is
+	// what lands in the iceberg column — the record key is only used to look
+	// up the value. This keeps top-level naming consistent with how nested
+	// struct fields supplied via metadata are named.
+	orderedMetaNames, err := r.resolver.topLevelFieldOrder(common)
+	if err != nil {
+		return nil, err
+	}
+	used := make(map[string]struct{}, len(record))
+	finalOrder := make([]orderedField, 0, len(record))
+	for _, metaName := range orderedMetaNames {
+		recordKey, ok := matchRecordKey(record, metaName, r.caseSensitive)
+		if !ok {
+			continue
+		}
+		if _, seen := used[recordKey]; seen {
+			continue
+		}
+		finalOrder = append(finalOrder, orderedField{recordKey: recordKey, emitName: metaName})
+		used[recordKey] = struct{}{}
+	}
+	for _, k := range slices.Sorted(maps.Keys(record)) {
+		if _, seen := used[k]; seen {
+			continue
+		}
+		finalOrder = append(finalOrder, orderedField{recordKey: k, emitName: k})
+	}
+
+	for _, f := range finalOrder {
+		value := record[f.recordKey]
+		fieldType, err := r.resolver.resolveTypeForCreateTable(f.emitName, value, msg, common, key.namespace, key.table, ti)
 		if err != nil {
-			return nil, fmt.Errorf("resolving type for field %q: %w", name, err)
+			return nil, fmt.Errorf("resolving type for field %q: %w", f.emitName, err)
 		}
 		if fieldType == nil {
 			continue // nil value, skip
 		}
 		fields = append(fields, iceberg.NestedField{
 			ID:       ti.allocateFieldID(), // For primitives this is the only allocation; for nested structs, inner IDs were already assigned by ti
-			Name:     name,
+			Name:     f.emitName,
 			Type:     fieldType,
 			Required: false,
 		})
 	}
 
 	return iceberg.NewSchema(0, fields...), nil
+}
+
+// orderedField pairs the key used to look up a value in the record with the
+// name that should land on the iceberg column. They differ in case-insensitive
+// mode when a metadata field matches a record key with different casing — the
+// metadata casing wins for the column, the record casing is needed to find the
+// value.
+type orderedField struct {
+	recordKey string
+	emitName  string
+}
+
+// matchRecordKey returns the actual key from record matching name, preserving
+// the record's casing. When caseSensitive is false, falls back to a case-folded
+// scan so schema-registry metadata authored with iceberg-canonical (typically
+// lowercase) names still matches arbitrarily-cased record keys.
+func matchRecordKey(record map[string]any, name string, caseSensitive bool) (string, bool) {
+	if _, ok := record[name]; ok {
+		return name, true
+	}
+	if caseSensitive {
+		return "", false
+	}
+	for k := range record {
+		if strings.EqualFold(k, name) {
+			return k, true
+		}
+	}
+	return "", false
 }
 
 // findCaseOnlyDuplicate returns the first pair of map keys that fold to the
